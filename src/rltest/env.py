@@ -1,10 +1,36 @@
 from collections import defaultdict
+from typing import Tuple, Dict
 
 import numpy as np
 import pettingzoo
 from pettingzoo.utils.env import AgentID, ActionType, ObsType
 import gymnasium
 from gymnasium import spaces
+from tensordict import TensorDictBase
+from torchrl.envs import PettingZooWrapper
+
+
+class PettingZooDictWrapper(PettingZooWrapper):
+    def __init__(self, env, **kwargs):
+        PettingZooWrapper.__init__(self, env, **kwargs)
+
+    def _step_parallel(
+        self,
+        tensordict: TensorDictBase,
+    ) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
+        action_dict = {}
+        for group, agents in self.group_map.items():
+            group_action = tensordict.get((group, "action"))
+            group_action_np = self.input_spec[
+                "full_action_spec", group, "action"
+            ].to_numpy(group_action)
+            for index, agent in enumerate(agents):
+                # extract agent actions from the dictionary
+                action = { key: group_action_np[key][index] for key in list(group_action.keys()) }
+                action_dict[agent] = action
+
+        return self._env.step(action_dict)
+
 
 class Environment(pettingzoo.ParallelEnv):
     """
