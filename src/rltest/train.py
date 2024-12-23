@@ -7,6 +7,7 @@ from torchrl.collectors import SyncDataCollector
 from torchrl.envs import PettingZooWrapper
 from torchrl.modules import ProbabilisticActor, MultiAgentMLP
 import torch.distributions as d
+import torch.nn.functional as f
 
 from rltest.env import Environment
 
@@ -21,7 +22,7 @@ class DirichletExtractor(nn.Module):
         self.linear = nn.Linear(8, 2)
 
     def forward(self, latent: torch.Tensor):
-        return self.linear(latent)
+        return f.softplus(self.linear(latent))
 
 dirichlet_extractor = TensorDictModule(
     module=DirichletExtractor(),
@@ -37,8 +38,8 @@ class BetaExtractor(nn.Module):
     def forward(self, latent: torch.Tensor):
         params = self.linear(latent)
         return {
-            ("params", "strength", "concentration0"): params[..., :2],
-            ("params", "strength", "concentration1"): params[..., 2:],
+            ("params", "strength", "concentration0"): f.softplus(params[..., :2]),
+            ("params", "strength", "concentration1"): f.softplus(params[..., 2:]),
         }
 
 beta_extractor = TensorDictModule(
@@ -47,6 +48,27 @@ beta_extractor = TensorDictModule(
     out_keys=[
         ("params", "strength", "concentration0"),
         ("params", "strength", "concentration1"),
+    ],
+)
+
+class GammaExtractor(nn.Module):
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.linear = nn.Linear(8, 4)
+
+    def forward(self, latent: torch.Tensor):
+        params = self.linear(latent)
+        return {
+            ("params", "healing", "concentration"): f.softplus(params[..., :2]),
+            ("params", "healing", "rate"): f.softplus(params[..., 2:]),
+        }
+
+gamma_extractor = TensorDictModule(
+    module=GammaExtractor(),
+    in_keys=("agent", "latent"),
+    out_keys=[
+        ("params", "healing", "concentration"),
+        ("params", "healing", "rate"),
     ],
 )
 
@@ -71,6 +93,7 @@ actor = tensordict.nn.TensorDictSequential(
     policy,
     dirichlet_extractor,
     beta_extractor,
+    gamma_extractor,
 )
 
 class SummingCompositeDistribution(CompositeDistribution):
@@ -83,15 +106,15 @@ class SummingCompositeDistribution(CompositeDistribution):
 
     def log_prob_composite(self, sample: TensorDictBase, include_sum=True, **kwargs) -> TensorDictBase:
         slp = torch.zeros([2])
-        d = {}
+        out_dict = {}
         for name, dist in self.dists.items():
             lp = dist.log_prob(sample.get(name))
             lp = lp.sum(dim=-1) if len(lp.shape) == 3 else lp
             slp = slp + lp
-        d["agent"] = {
+        out_dict["agent"] = {
             self.log_prob_key: slp
         }
-        sample.update(d)
+        sample.update(out_dict)
         return sample
 
 
@@ -104,10 +127,12 @@ actor = ProbabilisticActor(
         "distribution_map": {
             "target": d.Dirichlet,
             "strength": d.Beta,
+            "healing": d.Gamma,
         },
         "name_map": {
             "target": ("agent", "action", "target"),
             "strength": ("agent", "action", "strength"),
+            "healing": ("agent", "action", "healing"),
         }
     },
     return_log_prob=True,
