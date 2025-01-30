@@ -1,24 +1,48 @@
 import contextlib
-from typing import Tuple
+from typing import Tuple, Dict
 
 import tensordict
 import torch
 from tensordict import TensorDict, TensorDictBase
-from tensordict.nn import TensorDictModule, CompositeDistribution
+from tensordict.nn import TensorDictModule, CompositeDistribution, set_composite_lp_aggregate
 from torch import nn
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage, SamplerWithoutReplacement
 from torchrl.envs import PettingZooWrapper, TransformedEnv, RewardSum
+from torchrl.envs.libs.pettingzoo import _extract_nested_with_index
 from torchrl.modules import ProbabilisticActor, MultiAgentMLP
 import torch.distributions as d
 import torch.nn.functional as f
-from torchrl.objectives import ClipPPOLoss, ValueEstimators
+from torchrl.objectives import ClipPPOLoss, ValueEstimators, PPOLoss
 from torchrl.objectives.utils import _sum_td_features
 from tqdm import tqdm
 
 from rltest.env import Environment, PettingZooDictWrapper
 
-env = PettingZooDictWrapper(
+set_composite_lp_aggregate(False).set()
+
+class PettingZooWrapperWrapper(PettingZooWrapper):
+    def _step_parallel(
+        self,
+        tensordict: TensorDictBase,
+    ) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
+        action_dict = {}
+        for group, agents in self.group_map.items():
+            group_action = tensordict.get((group, "action"))
+            group_action_spec = (self.input_spec[
+                "full_action_spec", group, "action"
+            ])
+            valid_keys = [(key,) for key in list(group_action_spec.keys())]
+            group_action_filtered = group_action.select(*valid_keys)
+            group_action_np = group_action_spec.to_numpy(group_action_filtered)
+            for index, agent in enumerate(agents):
+                # group_action_np can be a dict or an array. We need to recursively index it
+                action = _extract_nested_with_index(group_action_np, index)
+                action_dict[agent] = action
+
+        return self._env.step(action_dict)
+
+env = PettingZooWrapperWrapper(
     env=Environment(),
     categorical_actions=False,
 )
@@ -107,39 +131,15 @@ actor = tensordict.nn.TensorDictSequential(
     gamma_extractor,
 )
 
-class SummingCompositeDistribution(CompositeDistribution):
-    def log_prob(self, sample: TensorDictBase, *, aggregate_probabilities: bool | None = None,
-                 **kwargs) -> torch.Tensor | TensorDictBase:
-        prob_out = self.log_prob_composite(sample, include_sum=True)
-        log_prob = prob_out.select(("agent", "sample_log_prob"))
-        #out = log_prob.get(("agent", "sample_log_prob"))
-        return log_prob
-
-    def log_prob_composite(self, sample: TensorDictBase, include_sum=True, **kwargs) -> TensorDictBase:
-        slp = torch.zeros([1])
-        out_dict = {}
-        for name, dist in self.dists.items():
-            lp = dist.log_prob(sample.get(name))
-
-            # TODO: beta and gamma distributions are univariate so they have one dim extra
-            if name[-1] == "target":
-                slp = slp + lp
-            else:
-                slp = slp + lp.sum(dim=-1)
-
-        # TODO: only return combined sample_log_prob key here
-        out_dict["agent"] = {
-            self.log_prob_key: slp
-        }
-        sample.update(out_dict)
-        return sample
-
-
 actor = ProbabilisticActor(
     module=actor,
     in_keys="params",
-    out_keys=("agent", "action"),
-    distribution_class=SummingCompositeDistribution,
+    out_keys=[
+        ("agent", "action", "target"),
+        ("agent", "action", "strength"),
+        ("agent", "action", "healing"),
+    ],
+    distribution_class=CompositeDistribution,
     distribution_kwargs={
         "distribution_map": {
             "target": d.Dirichlet,
@@ -153,7 +153,7 @@ actor = ProbabilisticActor(
         }
     },
     return_log_prob=True,
-    log_prob_key=("agent", "sample_log_prob"),
+    #log_prob_key=("agent", "sample_log_prob"),
 )
 
 collector = SyncDataCollector(
@@ -186,62 +186,7 @@ critic = TensorDictModule(
     out_keys=("agent", "state_value")
 )
 
-class CustomPPOLoss(ClipPPOLoss):
-    def __init__(self, *args, **kwargs):
-        ClipPPOLoss.__init__(self, *args, **kwargs)
-
-    def _log_weight(
-        self, tensordict: TensorDictBase
-    ) -> Tuple[torch.Tensor, d.Distribution]:
-        # current log_prob of actions
-        action = tensordict.get(self.tensor_keys.action)
-
-        with self.actor_network_params.to_module(
-            self.actor_network
-        ) if self.functional else contextlib.nullcontext():
-            dist = self.actor_network.get_dist(tensordict)
-
-        prev_log_prob = tensordict.get(self.tensor_keys.sample_log_prob)
-        if prev_log_prob.requires_grad:
-            raise RuntimeError(
-                f"tensordict stored {self.tensor_keys.sample_log_prob} requires grad."
-            )
-
-        if action.requires_grad:
-            raise RuntimeError(
-                f"tensordict stored {self.tensor_keys.action} requires grad."
-            )
-        if isinstance(action, torch.Tensor):
-            log_prob = dist.log_prob(action)
-        else:
-            if isinstance(dist, CompositeDistribution):
-                is_composite = True
-                kwargs = {
-                    "inplace": False,
-                    "aggregate_probabilities": False,
-                    "include_sum": False,
-                }
-            else:
-                is_composite = False
-                kwargs = {}
-            log_prob = dist.log_prob(tensordict, **kwargs)
-            if is_composite and not isinstance(prev_log_prob, TensorDict):
-                log_prob = _sum_td_features(log_prob)
-                log_prob.view_as(prev_log_prob)
-
-        # TODO: is this correct?
-        log_prob = log_prob.get(("agent", "sample_log_prob"))
-        prev_log_prob = prev_log_prob.get(("agent", "sample_log_prob"))
-
-        log_prob.view_as(prev_log_prob)
-        # END
-
-        log_weight = (log_prob - prev_log_prob).unsqueeze(-1)
-        kl_approx = (prev_log_prob - log_prob).unsqueeze(-1)
-
-        return log_weight, dist, kl_approx
-
-loss_module = CustomPPOLoss(
+loss_module = PPOLoss(
     actor_network=actor,
     critic_network=critic,
     entropy_coef=0.1,
@@ -251,7 +196,6 @@ loss_module = CustomPPOLoss(
 loss_module.set_keys(
     reward=env.reward_key,
     action=("agent", "action"),
-    sample_log_prob=("agent", "sample_log_prob"),
     value=("agent", "state_value"),
     done=("agent", "done"),
     terminated=("agent", "terminated"),
