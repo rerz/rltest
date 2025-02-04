@@ -72,7 +72,7 @@ class Environment(pettingzoo.ParallelEnv):
         return spaces.Dict([
             ("target", spaces.Box(0, 1, [2])), # probability of hitting each rock
             ("strength", spaces.Box(0, 1, [2])), # percentage strength to hit it with
-            ("healing", spaces.Box(0, 100, [2])) # each agent can heal rock for an absolute value < 100
+            ("healing", spaces.Box(0, 100, [2])), # each agent can heal rock for an absolute value < 100
         ])
 
     def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
@@ -95,9 +95,9 @@ class Environment(pettingzoo.ParallelEnv):
             target = agent_actions["target"]
             target = np.argmax(target)
 
-            damage = agent_actions["strength"] * self.agent_strengths[agent]
+            #damage = agent_actions["strength"] * self.agent_strengths[agent]
 
-            damage_dealt[agent] = (target, damage)
+            #damage_dealt[agent] = (target, damage)
 
 
         observations = {

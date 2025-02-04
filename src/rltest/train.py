@@ -1,11 +1,13 @@
 import contextlib
+import warnings
 from typing import Tuple, Dict
 
 import tensordict
 import torch
-from tensordict import TensorDict, TensorDictBase
-from tensordict.nn import TensorDictModule, CompositeDistribution, set_composite_lp_aggregate
+from tensordict import TensorDict, TensorDictBase, is_tensor_collection
+from tensordict.nn import TensorDictModule, CompositeDistribution, set_composite_lp_aggregate, dispatch
 from torch import nn
+from torchrl._utils import _standardize
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage, SamplerWithoutReplacement
 from torchrl.envs import PettingZooWrapper, TransformedEnv, RewardSum
@@ -14,7 +16,7 @@ from torchrl.modules import ProbabilisticActor, MultiAgentMLP
 import torch.distributions as d
 import torch.nn.functional as f
 from torchrl.objectives import ClipPPOLoss, ValueEstimators, PPOLoss
-from torchrl.objectives.utils import _sum_td_features
+from torchrl.objectives.utils import _sum_td_features, _reduce
 from tqdm import tqdm
 
 from rltest.env import Environment, PettingZooDictWrapper
@@ -73,8 +75,8 @@ class BetaExtractor(nn.Module):
     def forward(self, latent: torch.Tensor):
         params = self.linear(latent)
         return {
-            ("params", "strength", "concentration0"): f.softplus(params[..., :2]),
-            ("params", "strength", "concentration1"): f.softplus(params[..., 2:]),
+            ("params", "strength", "concentration0"): f.softplus(params[..., 0:2]),
+            ("params", "strength", "concentration1"): f.softplus(params[..., 2:4]),
         }
 
 beta_extractor = TensorDictModule(
@@ -94,8 +96,8 @@ class GammaExtractor(nn.Module):
     def forward(self, latent: torch.Tensor):
         params = self.linear(latent)
         return {
-            ("params", "healing", "concentration"): f.softplus(params[..., :2]),
-            ("params", "healing", "rate"): f.softplus(params[..., 2:]),
+            ("params", "healing", "concentration"): f.softplus(params[..., 0:2]),
+            ("params", "healing", "rate"): f.softplus(params[..., 2:4]),
         }
 
 gamma_extractor = TensorDictModule(
@@ -156,6 +158,66 @@ actor = ProbabilisticActor(
     #log_prob_key=("agent", "sample_log_prob"),
 )
 
+class CustomPPOLoss(ClipPPOLoss):
+    def __init__(self, *args, **kwargs):
+        ClipPPOLoss.__init__(self, *args, **kwargs)
+
+    @dispatch
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        tensordict = tensordict.clone(False)
+        advantage = tensordict.get(self.tensor_keys.advantage, None)
+        if advantage is None:
+            self.value_estimator(
+                tensordict,
+                params=self._cached_critic_network_params_detached,
+                target_params=self.target_critic_network_params,
+            )
+            advantage = tensordict.get(self.tensor_keys.advantage)
+        if self.normalize_advantage and advantage.numel() > 1:
+            if advantage.numel() > tensordict.batch_size.numel() and not len(
+                self.normalize_advantage_exclude_dims
+            ):
+                warnings.warn(
+                    "You requested advantage normalization and the advantage key has more dimensions"
+                    " than the tensordict batch. Make sure to pass `normalize_advantage_exclude_dims` "
+                    "if you want to keep any dimension independent while computing normalization statistics. "
+                    "If you are working in multi-agent/multi-objective settings this is highly suggested."
+                )
+            advantage = _standardize(advantage, self.normalize_advantage_exclude_dims)
+
+        log_weight, dist, kl_approx = self._log_weight(tensordict)
+        if is_tensor_collection(log_weight):
+            log_weight = log_weight.update({
+                ("agent", "action", "strength_log_prob"): log_weight[("agent", "action", "strength_log_prob")].sum(dim=-1, keepdim=False),
+                ("agent", "action", "healing_log_prob"): log_weight[("agent", "action", "healing_log_prob")].sum(dim=-1, keepdim=False),
+            })
+            log_weight = [weight for weight in log_weight.values(include_nested=True) if isinstance(weight, torch.Tensor)]
+            log_weight = torch.sum(torch.stack(log_weight), dim=0, keepdim=False)
+            log_weight = log_weight.view(advantage.shape)
+        neg_loss = log_weight.exp() * advantage
+        td_out = TensorDict({"loss_objective": -neg_loss}, batch_size=[])
+        td_out.set("kl_approx", kl_approx.detach().mean())  # for logging
+        if self.entropy_bonus:
+            entropy = self._get_entropy(dist)
+            if is_tensor_collection(entropy):
+                # Reports the entropy of each action head.
+                td_out.set("composite_entropy", entropy.detach())
+                entropy = _sum_td_features(entropy)
+            td_out.set("entropy", entropy.detach().mean())  # for logging
+            td_out.set("loss_entropy", -self.entropy_coef * entropy)
+        if self.critic_coef is not None:
+            loss_critic, value_clip_fraction = self.loss_critic(tensordict)
+            td_out.set("loss_critic", loss_critic)
+            if value_clip_fraction is not None:
+                td_out.set("value_clip_fraction", value_clip_fraction)
+        td_out = td_out.named_apply(
+            lambda name, value: _reduce(value, reduction=self.reduction).squeeze(-1)
+            if name.startswith("loss_")
+            else value,
+            batch_size=[],
+        )
+        return td_out
+
 collector = SyncDataCollector(
     create_env_fn=env,
     policy=actor,
@@ -186,7 +248,7 @@ critic = TensorDictModule(
     out_keys=("agent", "state_value")
 )
 
-loss_module = PPOLoss(
+loss_module = CustomPPOLoss(
     actor_network=actor,
     critic_network=critic,
     entropy_coef=0.1,
